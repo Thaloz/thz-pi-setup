@@ -1,7 +1,7 @@
 import { NodeServices } from "@effect/platform-node";
 import { assert, it } from "@effect/vitest";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, win32 } from "node:path";
 import { Effect, FileSystem } from "effect";
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import {
@@ -11,11 +11,14 @@ import {
   normalizeSearchPath,
 } from "./src/args.ts";
 import {
+  extractionInvocation,
   FD_INTEL_DARWIN_VERSION,
+  FD_VERSION,
   InstallError,
   readBoundedResponse,
   releaseAsset,
   resolveBinary,
+  RG_VERSION,
   TOOL_SPECS,
   UnsupportedPlatformError,
   type BinaryEnv,
@@ -173,13 +176,15 @@ function makeEnv(options: {
 }
 
 const darwinArm = { os: "darwin", arch: "arm64" } as const;
+const windowsX64 = { os: "win32", arch: "x64" } as const;
+const testBinDir = join(process.cwd(), "repo", "bin");
 
 it.effect("binary resolution: system fd wins and nothing is installed", () =>
   Effect.gen(function* () {
     const env = makeEnv({ available: ["fd"] });
     const resolved = yield* resolveBinary(
       TOOL_SPECS.fd,
-      "/repo/bin",
+      testBinDir,
       darwinArm,
       env,
     );
@@ -198,7 +203,7 @@ it.effect("binary resolution: fdfind is accepted as a system fd", () =>
     const env = makeEnv({ available: ["fdfind"] });
     const resolved = yield* resolveBinary(
       TOOL_SPECS.fd,
-      "/repo/bin",
+      testBinDir,
       darwinArm,
       env,
     );
@@ -214,17 +219,18 @@ it.effect("binary resolution: fdfind is accepted as a system fd", () =>
 
 it.effect("binary resolution: existing bin fallback is used silently", () =>
   Effect.gen(function* () {
-    const env = makeEnv({ available: ["/repo/bin/rg"] });
+    const bundledRg = join(testBinDir, "rg");
+    const env = makeEnv({ available: [bundledRg] });
     const resolved = yield* resolveBinary(
       TOOL_SPECS.rg,
-      "/repo/bin",
+      testBinDir,
       darwinArm,
       env,
     );
 
     assert.deepEqual(resolved, {
       tool: "rg",
-      command: "/repo/bin/rg",
+      command: bundledRg,
       source: "bundled",
     });
     assert.equal(env.installs.length, 0);
@@ -238,13 +244,13 @@ it.effect(
       const env = makeEnv({ available: [] });
       const resolved = yield* resolveBinary(
         TOOL_SPECS.rg,
-        "/repo/bin",
+        testBinDir,
         darwinArm,
         env,
       );
 
       assert.equal(resolved.source, "installed");
-      assert.equal(resolved.command, "/repo/bin/rg");
+      assert.equal(resolved.command, join(testBinDir, "rg"));
       assert.equal(env.installs.length, 1);
       assert.match(
         env.installs[0].url,
@@ -257,7 +263,7 @@ it.effect("binary resolution: install failure surfaces a typed error", () =>
   Effect.gen(function* () {
     const env = makeEnv({ available: [], installShouldFail: true });
     const error = yield* Effect.flip(
-      resolveBinary(TOOL_SPECS.fd, "/repo/bin", darwinArm, env),
+      resolveBinary(TOOL_SPECS.fd, testBinDir, darwinArm, env),
     );
 
     assert.instanceOf(error, InstallError);
@@ -273,7 +279,7 @@ it.effect(
       const error = yield* Effect.flip(
         resolveBinary(
           TOOL_SPECS.fd,
-          "/repo/bin",
+          testBinDir,
           { os: "linux", arch: "s390x" },
           env,
         ),
@@ -290,7 +296,7 @@ it.effect("binary resolution: one failed tool does not disable the other", () =>
       available: ["rg"],
       installShouldFail: true,
     });
-    const initializers = makeBinaryInitializers("/repo/bin", darwinArm, env);
+    const initializers = makeBinaryInitializers(testBinDir, darwinArm, env);
 
     const fdError = yield* Effect.flip(initializers.fd);
     const rg = yield* initializers.rg;
@@ -298,6 +304,37 @@ it.effect("binary resolution: one failed tool does not disable the other", () =>
     assert.instanceOf(fdError, InstallError);
     assert.deepEqual(rg, { tool: "rg", command: "rg", source: "system" });
   }),
+);
+
+it.effect(
+  "binary resolution: Windows reuses and installs .exe destinations",
+  () =>
+    Effect.gen(function* () {
+      const bundledFd = join(testBinDir, "fd.exe");
+      const reuseEnv = makeEnv({ available: [bundledFd] });
+      const reused = yield* resolveBinary(
+        TOOL_SPECS.fd,
+        testBinDir,
+        windowsX64,
+        reuseEnv,
+      );
+      assert.deepEqual(reused, {
+        tool: "fd",
+        command: bundledFd,
+        source: "bundled",
+      });
+      assert.deepEqual(reuseEnv.probes, ["fd", "fdfind", bundledFd]);
+
+      const installEnv = makeEnv({ available: [] });
+      const installed = yield* resolveBinary(
+        TOOL_SPECS.rg,
+        testBinDir,
+        windowsX64,
+        installEnv,
+      );
+      assert.equal(installed.command, join(testBinDir, "rg.exe"));
+      assert.equal(installed.source, "installed");
+    }),
 );
 
 it("release assets cover macOS and Linux on arm64 and x64 over HTTPS", () => {
@@ -312,6 +349,68 @@ it("release assets cover macOS and Linux on arm64 and x64 over HTTPS", () => {
       }
     }
   }
+});
+
+it("Windows x64 assets have exact official ZIP metadata", () => {
+  assert.deepEqual(releaseAsset("fd", windowsX64), {
+    url: `https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd-v${FD_VERSION}-x86_64-pc-windows-msvc.zip`,
+    fileName: `fd-v${FD_VERSION}-x86_64-pc-windows-msvc.zip`,
+    archiveFormat: "zip",
+    archiveDir: `fd-v${FD_VERSION}-x86_64-pc-windows-msvc`,
+    binaryName: "fd.exe",
+    version: FD_VERSION,
+    sha256: "b2816e506390a89941c63c9187d58a3cc10e9a55f2ef0685f9ea0eccaf7c98c8",
+  });
+  assert.deepEqual(releaseAsset("rg", windowsX64), {
+    url: `https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip`,
+    fileName: `ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip`,
+    archiveFormat: "zip",
+    archiveDir: `ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc`,
+    binaryName: "rg.exe",
+    version: RG_VERSION,
+    sha256: "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+  });
+  assert.isUndefined(releaseAsset("fd", { os: "win32", arch: "arm64" }));
+  assert.isUndefined(releaseAsset("rg", { os: "win32", arch: "ia32" }));
+});
+
+it("archive extraction selects safe flags and only the expected member", () => {
+  const windowsAsset = releaseAsset("fd", windowsX64);
+  const linuxAsset = releaseAsset("rg", { os: "linux", arch: "x64" });
+  assert.isDefined(windowsAsset);
+  assert.isDefined(linuxAsset);
+
+  assert.deepEqual(
+    extractionInvocation(
+      windowsAsset,
+      "C:\\staging\\fd.zip",
+      "C:\\staging",
+      "C:\\Windows",
+    ),
+    {
+      command: win32.join("C:\\Windows", "System32", "tar.exe"),
+      args: [
+        "-xf",
+        "C:\\staging\\fd.zip",
+        "-C",
+        "C:\\staging",
+        `fd-v${FD_VERSION}-x86_64-pc-windows-msvc/fd.exe`,
+      ],
+    },
+  );
+  assert.deepEqual(
+    extractionInvocation(linuxAsset, "/staging/rg.tar.gz", "/staging"),
+    {
+      command: "tar",
+      args: [
+        "-xzf",
+        "/staging/rg.tar.gz",
+        "-C",
+        "/staging",
+        `ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg`,
+      ],
+    },
+  );
 });
 
 it("linux assets use statically linked musl builds", () => {
@@ -363,12 +462,12 @@ it("notifications: only fresh installs notify", () => {
   };
   const bundled: ResolvedBinary = {
     tool: "rg",
-    command: "/repo/bin/rg",
+    command: join(testBinDir, "rg"),
     source: "bundled",
   };
   const installed: ResolvedBinary = {
     tool: "rg",
-    command: "/repo/bin/rg",
+    command: join(testBinDir, "rg"),
     source: "installed",
     version: "15.2.0",
   };
@@ -423,20 +522,20 @@ it("output: oversized results are truncated and persisted", async () => {
     "\n",
   );
   let persisted: string | undefined;
+  const fakeOutputPath = join(tmpdir(), "fake", "output.txt");
   const formatted = await formatOutput(bigOutput, {
     tempPrefix: "pi-fd-",
     persistFullOutput: async (full) => {
       persisted = full;
-      return "/tmp/fake/output.txt";
+      return fakeOutputPath;
     },
   });
   assert.isTrue(formatted.truncated);
-  assert.equal(formatted.fullOutputPath, "/tmp/fake/output.txt");
+  assert.equal(formatted.fullOutputPath, fakeOutputPath);
   assert.equal(persisted, bigOutput);
   assert.match(formatted.text, /\[Output truncated: 2000 of 3000 lines/);
-  assert.match(
-    formatted.text,
-    /Full output saved to: \/tmp\/fake\/output\.txt\]/,
+  assert.isTrue(
+    formatted.text.includes(`Full output saved to: ${fakeOutputPath}]`),
   );
   const shownLines = formatted.text.split("\n");
   assert.equal(shownLines[0], "file-0.ts");

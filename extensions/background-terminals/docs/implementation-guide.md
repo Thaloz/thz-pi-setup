@@ -304,12 +304,21 @@ kill-tree, terminate-with-escalation), minus the JSON-RPC machinery:
 ```ts
 import { spawn } from "node:child_process";
 
+const invocation = process.platform === "win32"
+  ? {
+      shell: process.env.ComSpec ?? "cmd.exe",
+      // /s strips this outer pair. It is required when the user command
+      // starts with a quoted executable path: /c ""C:\\Program Files\\app.exe" ..."
+      args: ["/d", "/s", "/c", `"${options.command}"`],
+    }
+  : { shell: "/bin/sh", args: ["-c", options.command] };
 const child = yield* Effect.try({
   try: () =>
-    spawn(shellPath, ["-c", options.command], {
+    spawn(invocation.shell, invocation.args, {
       cwd: options.cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],       // ← stdin IGNORED: no input surface, ever
+      windowsVerbatimArguments: process.platform === "win32", // pass the complete cmd line unchanged
       detached: process.platform !== "win32",  // own process group on POSIX → group kill
     }),
   catch: (error) => new SpawnError({ message: boundedError(error) }),
@@ -329,9 +338,14 @@ Decisions and rationale:
   remedy).
 - **`detached: true` on POSIX** gives the child its own process group, so kill can signal
   `-pid` and take down the whole tree (grandchildren from `npm run dev` etc.). `killTree`
-  keeps the direct-signal fallback when the group is gone; Windows uses `taskkill /T` and
-  adds `/F` for the force-kill phase. `terminateChild` uses Effect
-  callbacks/timeouts: SIGTERM now, SIGKILL after 2s if needed, then a final 500ms bound.
+  keeps the direct-signal fallback when the group is gone. Windows uses `taskkill /T /F`
+  from the first termination attempt so descendants cannot escape between phases, and sets
+  `windowsVerbatimArguments` when manually spawning `cmd.exe` so Node does not re-quote the
+  complete command line. The `/c` command is wrapped in an explicit outer quote pair because
+  `/s` strips that pair; thus a user command starting with `"C:\\Program Files\\app.exe"`
+  reaches cmd as `/c ""C:\\Program Files\\app.exe" ..."` instead of losing the executable's
+  opening quote. On POSIX, `terminateChild` uses Effect callbacks/timeouts: SIGTERM
+  now, SIGKILL after 2s if needed, then a final 500ms bound.
   Do NOT call `child.unref()` — we want the exit event, and pi owns the lifetime anyway.
 - **Spawn failure semantics.** `spawn()` itself rarely throws; ENOENT arrives via
   `child.once("error", ...)`. Wire the error handler *before* returning from `start`, and treat
@@ -838,8 +852,9 @@ tricks; they exist on any machine running pi)
    running→done, exitCode 0, both buffers correct and separate, settle hook fired once with
    `consumed: false`.
 2. non-zero exit → `failed`, exitCode captured.
-3. `kill` on a `setInterval` never-exiting script → `killed`, signal recorded, `kill()` only
-   resolves after settle; second `kill` of same id reports already-settled, no error.
+3. `kill` on a `setInterval` never-exiting script → `killed`, with a POSIX signal recorded
+   on POSIX and no invented signal on Windows; `kill()` only resolves after settle; second
+   `kill` of the same id reports already-settled, no error.
 4. process-tree termination: spawn a grandchild that updates a unique heartbeat sentinel,
    kill, then use bounded polling with an explicit timeout to confirm both that the process is
    gone and that its unique sentinel stopped changing. The sentinel ties the assertion to the

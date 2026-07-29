@@ -15,7 +15,7 @@
 import { NodeHttpClient, NodeServices } from "@effect/platform-node";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Crypto, Data, Effect, Encoding, FileSystem, Stream } from "effect";
@@ -39,6 +39,8 @@ const FD_SHA256: Readonly<Record<string, string>> = {
     "50d30f13fe3d5914b14c4fff5abcbd4d0cdab4b855970a6956f4f006c17117a3",
   "aarch64-unknown-linux-musl":
     "f32d3657473fba74e2600babc8db0b93420d51169223b7e8143b2ed55d8fd9e8",
+  "x86_64-pc-windows-msvc":
+    "b2816e506390a89941c63c9187d58a3cc10e9a55f2ef0685f9ea0eccaf7c98c8",
   "x86_64-unknown-linux-musl":
     "e3257d48e29a6be965187dbd24ce9af564e0fe67b3e73c9bdcd180f4ec11bdde",
 };
@@ -50,6 +52,8 @@ const RG_SHA256: Readonly<Record<string, string>> = {
     "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
   "aarch64-unknown-linux-musl":
     "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+  "x86_64-pc-windows-msvc":
+    "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
   "x86_64-unknown-linux-musl":
     "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
 };
@@ -61,7 +65,7 @@ export interface ToolSpec {
   readonly tool: ToolName;
   /** Commands probed on PATH, in order. Debian/Ubuntu install fd as `fdfind`. */
   readonly systemCommands: readonly string[];
-  /** Executable name used inside release archives and the repo bin directory. */
+  /** Base executable name used in the repo bin directory. */
   readonly binaryName: string;
 }
 
@@ -75,10 +79,13 @@ export interface PlatformTarget {
   readonly arch: string;
 }
 
+export type ArchiveFormat = "tar.gz" | "zip";
+
 export interface ReleaseAsset {
   readonly url: string;
   readonly fileName: string;
-  /** Top-level directory inside the tarball. */
+  readonly archiveFormat: ArchiveFormat;
+  /** Top-level directory inside the release archive. */
   readonly archiveDir: string;
   readonly binaryName: string;
   readonly version: string;
@@ -96,6 +103,9 @@ function targetTriple(target: PlatformTarget) {
   if (target.os === "darwin") return `${cpu}-apple-darwin`;
   // musl builds are statically linked, so they run on any Linux distribution.
   if (target.os === "linux") return `${cpu}-unknown-linux-musl`;
+  if (target.os === "win32" && target.arch === "x64") {
+    return "x86_64-pc-windows-msvc";
+  }
   return undefined;
 }
 
@@ -114,12 +124,14 @@ export function releaseAsset(
     const version =
       triple === "x86_64-apple-darwin" ? FD_INTEL_DARWIN_VERSION : FD_VERSION;
     const archiveDir = `fd-v${version}-${triple}`;
-    const fileName = `${archiveDir}.tar.gz`;
+    const archiveFormat = target.os === "win32" ? "zip" : "tar.gz";
+    const fileName = `${archiveDir}.${archiveFormat}`;
     return {
       url: `https://github.com/sharkdp/fd/releases/download/v${version}/${fileName}`,
       fileName,
+      archiveFormat,
       archiveDir,
-      binaryName: "fd",
+      binaryName: target.os === "win32" ? "fd.exe" : "fd",
       version,
       sha256,
     };
@@ -128,12 +140,14 @@ export function releaseAsset(
   const sha256 = RG_SHA256[triple];
   if (!sha256) return undefined;
   const archiveDir = `ripgrep-${RG_VERSION}-${triple}`;
-  const fileName = `${archiveDir}.tar.gz`;
+  const archiveFormat = target.os === "win32" ? "zip" : "tar.gz";
+  const fileName = `${archiveDir}.${archiveFormat}`;
   return {
     url: `https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${fileName}`,
     fileName,
+    archiveFormat,
     archiveDir,
-    binaryName: "rg",
+    binaryName: target.os === "win32" ? "rg.exe" : "rg",
     version: RG_VERSION,
     sha256,
   };
@@ -178,6 +192,16 @@ export interface ResolvedBinary {
   readonly version?: string;
 }
 
+export function binaryDestination(
+  spec: ToolSpec,
+  binDir: string,
+  target: PlatformTarget,
+) {
+  const binaryName =
+    target.os === "win32" ? `${spec.binaryName}.exe` : spec.binaryName;
+  return join(binDir, binaryName);
+}
+
 /** Resolve one tool: system binary, existing bin fallback, or fresh install. */
 export function resolveBinary(
   spec: ToolSpec,
@@ -192,7 +216,7 @@ export function resolveBinary(
       }
     }
 
-    const bundled = join(binDir, spec.binaryName);
+    const bundled = binaryDestination(spec, binDir, target);
     if (yield* env.probe(bundled, spec.tool)) {
       return { tool: spec.tool, command: bundled, source: "bundled" as const };
     }
@@ -323,6 +347,31 @@ function downloadAsset(client: HttpClient.HttpClient, initialUrl: URL) {
   });
 }
 
+export interface ExtractionInvocation {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+/** Build the bounded extraction command for exactly the expected member. */
+export function extractionInvocation(
+  asset: ReleaseAsset,
+  archivePath: string,
+  workDir: string,
+  systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows",
+): ExtractionInvocation {
+  const member = `${asset.archiveDir}/${asset.binaryName}`;
+  if (asset.archiveFormat === "zip") {
+    return {
+      command: win32.join(systemRoot, "System32", "tar.exe"),
+      args: ["-xf", archivePath, "-C", workDir, member],
+    };
+  }
+  return {
+    command: "tar",
+    args: ["-xzf", archivePath, "-C", workDir, member],
+  };
+}
+
 /** Real environment: probes via `--version`, installs via HTTPS + tar. */
 export const liveBinaryEnv: BinaryEnv = {
   probe: (command, tool) =>
@@ -372,19 +421,20 @@ export const liveBinaryEnv: BinaryEnv = {
       const archivePath = join(workDir, asset.fileName);
       yield* fs.writeFile(archivePath, bytes);
 
-      const tarExitCode = yield* Effect.scoped(
+      const extraction = extractionInvocation(asset, archivePath, workDir);
+      const extractionExitCode = yield* Effect.scoped(
         Effect.gen(function* () {
           const tar = yield* ChildProcess.make(
-            "tar",
-            ["-xzf", archivePath, "-C", workDir],
+            extraction.command,
+            extraction.args,
             { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
           );
           return yield* tar.exitCode;
         }),
       ).pipe(Effect.timeout(60_000));
-      if (tarExitCode !== ChildProcessSpawner.ExitCode(0)) {
+      if (extractionExitCode !== ChildProcessSpawner.ExitCode(0)) {
         return yield* Effect.fail(
-          new Error(`tar failed with exit code ${tarExitCode}`),
+          new Error(`tar failed with exit code ${extractionExitCode}`),
         );
       }
 

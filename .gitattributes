@@ -1,0 +1,10 @@
+# Use one canonical line ending in the repository and working trees on all platforms.
+* text=auto eol=lf
+
+# Keep binary assets out of text normalization.
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.png binary
+*.webp binary

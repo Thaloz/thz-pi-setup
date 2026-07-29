@@ -171,7 +171,10 @@ export class TerminalManager extends Context.Service<
 function shellInvocation(command: string) {
   if (process.platform === "win32") {
     const shell = process.env.ComSpec ?? "cmd.exe";
-    return { shell, args: ["/d", "/s", "/c", command] };
+    // With /s, cmd.exe strips the first and last quotes around the /c
+    // command. Supply that outer pair explicitly so a command beginning with
+    // a quoted executable becomes: /c ""C:\\path with spaces\\app.exe" ..."
+    return { shell, args: ["/d", "/s", "/c", `"${command}"`] };
   }
   return { shell: "/bin/sh", args: ["-c", command] };
 }
@@ -183,12 +186,7 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals) {
     try {
       const killer = spawn(
         "taskkill",
-        [
-          "/pid",
-          String(child.pid),
-          "/T",
-          ...(signal === "SIGKILL" ? ["/F"] : []),
-        ],
+        ["/pid", String(child.pid), "/T", "/F"],
         { stdio: "ignore", windowsHide: true },
       );
       killer.once("error", () => {
@@ -560,6 +558,9 @@ const makeManager = Effect.gen(function* () {
               // stdin IGNORED: there is no input surface, ever. A process
               // that reads stdin sees EOF immediately.
               stdio: ["ignore", "pipe", "pipe"],
+              // The cmd.exe command is already a complete command line;
+              // prevent Node from quoting it a second time on Windows.
+              windowsVerbatimArguments: process.platform === "win32",
               // Own process group on POSIX → group kill takes the whole tree.
               detached: process.platform !== "win32",
             }),

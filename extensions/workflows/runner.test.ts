@@ -6,11 +6,14 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { RunController } from "./controller.ts";
 import {
   createFirstResponseWatchdog,
   guardWorkflowChildTools,
   recordToolExecutionTiming,
   transcriptFromMessages,
+  waitForAgentAbort,
+  waitForOperationOrAbort,
   type ToolExecutionTiming,
 } from "./runner.ts";
 
@@ -209,6 +212,72 @@ test("first assistant response disarms the watchdog without limiting the run", a
     new Promise<string>((resolve) => setTimeout(() => resolve("done"), 20)),
   );
   assert.equal(result, "done");
+});
+
+test("workflow cancellation stops awaiting a non-cooperative agent operation", async () => {
+  const controller = new AbortController();
+  let abortCalls = 0;
+  const pending = waitForOperationOrAbort(
+    new Promise<never>(() => {}),
+    controller.signal,
+    () => {
+      abortCalls++;
+    },
+  );
+
+  controller.abort(new Error("cancel fixture"));
+  await assert.rejects(pending, /cancel fixture/);
+  assert.equal(abortCalls, 1);
+});
+
+test("workflow controller settles after cancelling a non-cooperative agent operation", async () => {
+  const controller = new RunController();
+  const pending = controller.schedule((signal) =>
+    waitForOperationOrAbort(new Promise<never>(() => {}), signal, () => {}),
+  );
+
+  const rejected = assert.rejects(pending, /cancel fixture/);
+  controller.abort("cancel fixture");
+  assert.equal(await controller.settle({ abort: true, timeoutMs: 100 }), true);
+  await rejected;
+});
+
+test("workflow cancellation still settles when the SDK abort call throws", async () => {
+  const controller = new AbortController();
+  const pending = waitForOperationOrAbort(
+    new Promise<never>(() => {}),
+    controller.signal,
+    () => {
+      throw new Error("abort implementation failed");
+    },
+  );
+
+  controller.abort(new Error("cancel fixture"));
+  await assert.rejects(pending, /cancel fixture/);
+});
+
+test("completed agent operations detach their cancellation listener", async () => {
+  const controller = new AbortController();
+  let abortCalls = 0;
+  assert.equal(
+    await waitForOperationOrAbort(
+      Promise.resolve("done"),
+      controller.signal,
+      () => {
+        abortCalls++;
+      },
+    ),
+    "done",
+  );
+
+  controller.abort(new Error("late cancellation"));
+  assert.equal(abortCalls, 0);
+});
+
+test("agent abort cleanup has a bounded grace period", async () => {
+  const startedAt = Date.now();
+  await waitForAgentAbort(new Promise<never>(() => {}), 10);
+  assert.ok(Date.now() - startedAt < 250);
 });
 
 test("workflow children guard structured, normal, and dynamically registered tools", async () => {

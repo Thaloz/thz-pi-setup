@@ -41,6 +41,7 @@ import { safeStringify, truncateUtf8 } from "./serialization.ts";
 
 const AGENT_OUTPUT_MAX_BYTES = 64 * 1024;
 export const FIRST_RESPONSE_TIMEOUT_MS = 45_000;
+export const AGENT_ABORT_GRACE_MS = 1_000;
 const TRANSCRIPT_ENTRY_MAX_BYTES = 16 * 1024;
 const TRANSCRIPT_TOTAL_MAX_BYTES = 256 * 1024;
 const TRANSCRIPT_MAX_ENTRIES = 200;
@@ -373,6 +374,76 @@ function errorText(error: unknown): string {
   );
 }
 
+function abortError(signal: AbortSignal) {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Agent operation was aborted");
+}
+
+/**
+ * Stop awaiting a potentially non-cooperative SDK operation as soon as its
+ * owning workflow is cancelled. The original promise remains observed so a
+ * later rejection cannot become unhandled.
+ */
+export function waitForOperationOrAbort<T>(
+  operation: Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) {
+    try {
+      onAbort();
+    } catch {
+      // Cancellation must still release the waiter if SDK abort throws.
+    }
+    return Promise.reject(abortError(signal));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", handleAbort);
+      callback();
+    };
+    const handleAbort = () => {
+      try {
+        onAbort();
+      } catch {
+        // Cancellation must still release the waiter if SDK abort throws.
+      }
+      finish(() => reject(abortError(signal)));
+    };
+
+    signal.addEventListener("abort", handleAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+/** Allow the SDK a short grace period to finish aborting before disposal. */
+export async function waitForAgentAbort(
+  operation: Promise<unknown>,
+  timeoutMs = AGENT_ABORT_GRACE_MS,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  await Promise.race([
+    operation.then(
+      () => undefined,
+      () => undefined,
+    ),
+    timeout,
+  ]);
+  if (timer) clearTimeout(timer);
+}
+
 function formatTimeout(timeoutMs: number) {
   return timeoutMs % 1_000 === 0
     ? `${timeoutMs / 1_000} seconds`
@@ -558,10 +629,7 @@ export async function runAgent(
     aborted = true;
     abortPromise ??= childSession.abort().catch(() => {});
   };
-  if (options.signal) {
-    if (options.signal.aborted) onAbort();
-    else options.signal.addEventListener("abort", onAbort, { once: true });
-  }
+  if (options.signal?.aborted) onAbort();
 
   let output = "";
   let transcript: TranscriptEntry[] = [];
@@ -573,17 +641,20 @@ export async function runAgent(
       });
       markFirstResponse = watchdog.markResponse;
       await watchdog.waitFor(
-        childSession.prompt(buildWorkflowAgentPrompt(options.prompt)),
+        waitForOperationOrAbort(
+          childSession.prompt(buildWorkflowAgentPrompt(options.prompt)),
+          options.signal,
+          onAbort,
+        ),
       );
     }
   } catch (error) {
     errorMessage = errorMessage ?? errorText(error);
     stopReason = stopReason ?? "error";
   } finally {
-    options.signal?.removeEventListener("abort", onAbort);
-    if (abortPromise) await abortPromise;
     unsubscribe();
     unsubscribeToolTimeout?.();
+    if (abortPromise) await waitForAgentAbort(abortPromise);
     sync();
     output = truncateUtf8(
       finalOutput(childSession.messages),
